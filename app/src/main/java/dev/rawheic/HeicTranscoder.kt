@@ -4,10 +4,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.graphics.Gainmap
 import android.os.Build
 import android.util.Log
-
+import androidx.exifinterface.media.ExifInterface
+import androidx.heifwriter.HeifWriter
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -19,9 +19,8 @@ import kotlin.math.min
 import kotlin.math.pow
 
 /**
- * Converts a DNG (RAW) + JPEG capture pair into a HEIC file that keeps the
- * HDR gain map (ISO 21496-1) attached, so the result stays "Ultra HDR"
- * while being far smaller than the original DNG.
+ * Converts a DNG (RAW) + JPEG capture pair into a compact file that keeps
+ * the HDR gain map attached whenever one could be computed.
  *
  * Pipeline:
  *  1. Decode the camera's processed JPEG (the ISP tone map — the same base
@@ -31,12 +30,16 @@ import kotlin.math.pow
  *     rendition blended over the SDR base.
  *  3. Compute the per-pixel log2 gain map between the HDR rendition and the
  *     SDR base.
- *  4. Attach the [Gainmap] to the SDR bitmap and let the platform HEIC
- *     encoder write base + gain map metadata into one HEIC file.
+ *  4. Encode:
+ *       - With a gain map: an UltraHDR-style JPEG — SDR base + gain map
+ *         secondary image joined with an MPF multi-picture segment and
+ *         XMP GContainer/hdrgm metadata (the layout libultrahdr writes,
+ *         readable by Android's HDR pipeline).
+ *       - Without: a true HEIC via androidx.heifwriter.HeifWriter.
  *
- * If any step is unsupported (JPEG-compressed DNG, no HEIC encoder, older
- * API), the pipeline degrades gracefully: HDR-with-gain-map → SDR HEIC →
- * JPEG. The shot is never lost.
+ * The platform HEIC encoder cannot embed ISO 21496-1 gain maps, so shots
+ * with recoverable highlights are stored as gain-map JPEGs; the rest get
+ * the full HEIC size win. Either way the shot is never lost.
  */
 object HeicTranscoder {
 
@@ -62,6 +65,12 @@ object HeicTranscoder {
         val gainMapAttached: Boolean
     )
 
+    private data class GainMapData(
+        val bitmap: Bitmap,
+        val minGain: Float,
+        val maxGain: Float
+    )
+
     fun transcode(
         context: Context,
         dngFile: File?,
@@ -71,22 +80,28 @@ object HeicTranscoder {
             Log.e(TAG, "Failed to decode JPEG")
             return null
         }
-
+        val exif = runCatching { ExifInterface(jpegFile.absolutePath) }.getOrNull()
 
         val hdrBitmap: Bitmap? = dngFile
             ?.takeIf { it.exists() && it.length() > 0 }
             ?.let { buildHdrRendition(base, it) }
 
         val gainMap = hdrBitmap?.let { computeGainMap(base, it) }
+        hdrBitmap?.recycle()
 
-        val encoded = encodeHeic(context, base, gainMap) ?: run {
-            Log.w(TAG, "HEIC encode failed; falling back to JPEG")
-            val fallback = File(context.cacheDir, "fallback_${System.currentTimeMillis()}.jpg")
-            fallback.outputStream().use { base.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-            return Result(fallback, fallback.length(), false)
+        val encoded = if (gainMap != null) {
+            encodeUltraHdrJpeg(context, base, gainMap, exif)
+                ?: encodeHeic(context, base, exif)
+        } else {
+            encodeHeic(context, base, exif)
+        } ?: run {
+            Log.w(TAG, "All encoders failed; falling back to plain JPEG")
+            encodePlainJpeg(context, base, exif)
+        } ?: run {
+            Log.e(TAG, "Encode failed")
+            return null
         }
 
-        hdrBitmap?.recycle()
         return Result(encoded, encoded.length(), gainMap != null)
     }
 
@@ -397,12 +412,11 @@ object HeicTranscoder {
 
     /**
      * Single-channel log2 gain map between SDR base and HDR rendition per
-     * UltraHDR / ISO 21496-1: gain = log2(hdr / sdr) in linear light,
-     * clamped to [1, MAX_GAIN_HEADROOM] — SDR is the floor, never dimmed.
+     * ISO 21496-1: gain = log2(hdr / sdr) in linear light, clamped to
+     * [1, MAX_GAIN_HEADROOM] — SDR is the floor, never dimmed.
      */
-    private fun computeGainMap(sdr: Bitmap, hdr: Bitmap): Gainmap? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return null
-        return runCatching<Gainmap?> {
+    private fun computeGainMap(sdr: Bitmap, hdr: Bitmap): GainMapData? {
+        return runCatching<GainMapData?> {
             val w = sdr.width / GAIN_MAP_SCALE
             val h = sdr.height / GAIN_MAP_SCALE
             val smallSdr = Bitmap.createScaledBitmap(sdr, w, h, true)
@@ -432,12 +446,7 @@ object HeicTranscoder {
             gain.setPixels(outPx, 0, w, 0, 0, w, h)
             smallSdr.recycle()
             smallHdr.recycle()
-
-            Gainmap(gain).apply {
-                setRatioMax(maxGain, maxGain, maxGain)
-                setMinDisplayRatioForHdrTransition(1f)
-                setDisplayRatioForFullHdr(maxGain)
-            }
+            GainMapData(gain, minGain, maxGain)
         }.onFailure { Log.w(TAG, "gain map computation failed", it) }.getOrNull()
     }
 
@@ -448,37 +457,203 @@ object HeicTranscoder {
             0.0722f * byteToLinear(Color.blue(px))
 
     // ---------------------------------------------------------------- //
-    // HEIC encoding
+    // Encoders
     // ---------------------------------------------------------------- //
 
-    /** Encode SDR base + optional gain map to HEIC using the platform encoder. */
+    /**
+     * UltraHDR-style JPEG: SDR base + grayscale gain map joined with an MPF
+     * multi-picture segment and XMP metadata (GContainer on the primary,
+     * hdrgm on the secondary), mirroring libultrahdr's output layout.
+     */
+    private fun encodeUltraHdrJpeg(
+        context: Context,
+        base: Bitmap,
+        gainMap: GainMapData,
+        exif: ExifInterface?
+    ): File? = runCatching {
+        val primary0 = ByteArrayOutputStream().also {
+            base.compress(Bitmap.CompressFormat.JPEG, 95, it)
+        }.toByteArray()
+
+        val secondary0 = ByteArrayOutputStream().also {
+            gainMap.bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it)
+        }.toByteArray()
+
+        // Fixed-width numbers keep XMP length (and thus primary size) stable.
+        val xmpHdrgm =
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">" +
+                "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">" +
+                "<rdf:Description rdf:about=\"\" " +
+                "xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\" " +
+                "hdrgm:Version=\"1.0\" " +
+                "hdrgm:Min=\"${"%.4f".format(gainMap.minGain)}\" " +
+                "hdrgm:Max=\"${"%.4f".format(gainMap.maxGain)}\" " +
+                "hdrgm:Gamma=\"1.0\" " +
+                "hdrgm:OffsetSDR=\"0.0\" hdrgm:OffsetHDR=\"0.0\" " +
+                "hdrgm:HDRCapacityMin=\"0.0\" " +
+                "hdrgm:HDRCapacityMax=\"${"%.4f".format(gainMap.maxGain)}\"/>" +
+                "</rdf:RDF></x:xmpmeta>"
+        val secondary = insertApp1(secondary0, xmpHdrgm)
+
+        // MP Entry offsets are relative to the MP Endian field, which sits at
+        // SOI(2) + APP1(4+xmpDirLen) + APP2 marker+len(4) + "MPF\0"(4).
+        fun buildXmpDirectory(primaryLen: Int, secondaryLen: Int): String =
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">" +
+                "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">" +
+                "<rdf:Description rdf:about=\"\" " +
+                "xmlns:Container=\"http://ns.google.com/photos/1.0/container/\" " +
+                "xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\" " +
+                "Container:Directory=\"" +
+                "<rdf:Seq>" +
+                "<rdf:li rdf:parseType=\"Resource\">" +
+                "<Container:Item Item:Semantic=\"Primary\" Item:Length=\"${"%010d".format(primaryLen)}\"/>" +
+                "</rdf:li>" +
+                "<rdf:li rdf:parseType=\"Resource\">" +
+                "<Container:Item Item:Semantic=\"GainMap\" Item:Length=\"${"%010d".format(secondaryLen)}\"/>" +
+                "</rdf:li>" +
+                "</rdf:Seq>\"/>" +
+                "</rdf:RDF></x:xmpmeta>"
+
+        var xmpDir = buildXmpDirectory(primary0.size, secondary.size)
+        var primary = insertApp1(primary0, xmpDir)
+        primary = insertApp2Mpf(primary, secondary)
+        // Distance from the MP Endian field to the appended secondary:
+        // SOI(2) + APP1(4 + marker + xmpDir) + APP2 marker+len(4) + "MPF\0"(4).
+        val endianStart = 2 + 4 + XMP_MARKER.length + xmpDir.length + 4 + 4
+        val secondaryOffset = primary.size - endianStart
+        xmpDir = buildXmpDirectory(primary.size, secondary.size)
+        primary = insertApp1(primary0, xmpDir)
+        primary = insertApp2Mpf(primary, secondary)
+        check(primary.size - endianStart == secondaryOffset)
+
+        val outFile = File(context.cacheDir, "out_${System.currentTimeMillis()}.jpg")
+        outFile.writeBytes(primary + secondary)
+        applyExif(outFile, exif)
+        outFile.takeIf { it.length() > 0 } ?: run { outFile.delete(); null }
+    }.onFailure { Log.w(TAG, "UltraHDR JPEG encode failed", it) }.getOrNull()
+
     private fun encodeHeic(
         context: Context,
         base: Bitmap,
-        gainMap: Gainmap?
+        exif: ExifInterface?
     ): File? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
-        // Probe that the platform encoder actually produces HEIF output.
-        val probeOk = runCatching {
-            val probe = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888)
-            val baos = ByteArrayOutputStream()
-            val ok = probe.compress(Bitmap.CompressFormat.HEIF, 90, baos)
-            probe.recycle()
-            ok && baos.size() > 0
-        }.getOrDefault(false)
-        if (!probeOk) return null
+        return runCatching {
+            val outFile = File(context.cacheDir, "out_${System.currentTimeMillis()}.heic")
+            val writer = HeifWriter.Builder(
+                outFile.absolutePath, base.width, base.height, HeifWriter.INPUT_MODE_BITMAP
+            )
+                .setQuality(90)
+                .setMaxImages(1)
+                .build()
+            writer.start()
+            writer.addBitmap(base)
+            writer.stop(10_000)
+            applyExif(outFile, exif)
+            outFile.takeIf { it.length() > 0 } ?: run { outFile.delete(); null }
+        }.onFailure { Log.w(TAG, "HEIC encode failed", it) }.getOrNull()
+    }
 
-        val outFile = File(context.cacheDir, "out_${System.currentTimeMillis()}.heic")
-        if (gainMap != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            base.gainmap = gainMap
+    private fun encodePlainJpeg(
+        context: Context,
+        base: Bitmap,
+        exif: ExifInterface?
+    ): File? = runCatching {
+        val outFile = File(context.cacheDir, "out_${System.currentTimeMillis()}.jpg")
+        outFile.outputStream().use { base.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+        applyExif(outFile, exif)
+        outFile.takeIf { it.length() > 0 } ?: run { outFile.delete(); null }
+    }.getOrNull()
+
+    // ---------------------------------------------------------------- //
+    // JPEG segment helpers
+    // ---------------------------------------------------------------- //
+
+    private const val XMP_MARKER = "http://ns.adobe.com/xap/1.0/\u0000"
+
+    /** Insert an APP1 segment carrying [xmpPayload] right after the SOI. */
+    private fun insertApp1(jpeg: ByteArray, xmpPayload: String): ByteArray {
+        val payload = (XMP_MARKER + xmpPayload).toByteArray(Charsets.ISO_8859_1)
+        require(payload.size + 2 <= 0xFFFF)
+        val out = ByteArray(2 + 2 + payload.size + jpeg.size - 2)
+        out[0] = jpeg[0]; out[1] = jpeg[1] // SOI
+        out[2] = 0xFF.toByte(); out[3] = 0xE1.toByte()
+        val segLen = payload.size + 2
+        out[4] = ((segLen ushr 8) and 0xFF).toByte()
+        out[5] = (segLen and 0xFF).toByte()
+        payload.copyInto(out, 6)
+        jpeg.copyInto(out, 6 + payload.size, 2)
+        return out
+    }
+
+    /**
+     * Insert an APP2 segment with an MPF index pointing at the [secondary]
+     * image that the caller appends right after the primary.
+     */
+    private fun insertApp2Mpf(primary: ByteArray, secondary: ByteArray): ByteArray {
+        val mpf = buildMpf(primary.size, secondary.size)
+        val out = ByteArray(2 + 2 + mpf.size + primary.size - 2)
+        out[0] = primary[0]; out[1] = primary[1] // SOI
+        out[2] = 0xFF.toByte(); out[3] = 0xE2.toByte()
+        val segLen = mpf.size + 2
+        out[4] = ((segLen ushr 8) and 0xFF).toByte()
+        out[5] = (segLen and 0xFF).toByte()
+        mpf.copyInto(out, 6)
+        primary.copyInto(out, 6 + mpf.size, 2)
+        return out
+    }
+
+    /**
+     * Build the MPF (CIPA DC-x 007) index segment: signature, big-endian
+     * TIFF header, 3 index tags, then 2 MP entries. Offsets are measured
+     * from the MP Endian field.
+     */
+    private fun buildMpf(primarySize: Int, secondarySize: Int): ByteArray {
+        val buf = ByteArrayOutputStream()
+        fun u16(v: Int) { buf.write((v ushr 8) and 0xFF); buf.write(v and 0xFF) }
+        fun u32(v: Int) {
+            buf.write((v ushr 24) and 0xFF); buf.write((v ushr 16) and 0xFF)
+            buf.write((v ushr 8) and 0xFF); buf.write(v and 0xFF)
         }
-        val ok = runCatching {
-            outFile.outputStream().use { base.compress(Bitmap.CompressFormat.HEIF, 90, it) }
-        }.getOrDefault(false)
-        if (!ok || outFile.length() == 0L) {
-            outFile.delete()
-            return null
-        }
-        return outFile
+
+        buf.write('M'.code); buf.write('P'.code); buf.write('F'.code); buf.write(0)
+        buf.write('M'.code); buf.write('M'.code); buf.write(0); buf.write(0x2A) // MM\0* BE
+        u32(8)                       // offset to index IFD (after endian field)
+        u16(3)                       // 3 tags
+        // 0xB000 MPF version, undefined type, inline "0100"
+        u16(0xB000); u16(7); u32(4); buf.write('0'.code); buf.write('1'.code)
+        buf.write('0'.code); buf.write('0'.code)
+        // 0xB001 number of images, LONG, value 2
+        u16(0xB001); u16(4); u32(1); u32(2)
+        // 0xB002 MP entries, undefined type, 48 bytes at offset 50
+        // (endian 4 + magic 4 + ifdOffset 4 + count 2 + 3 tags x 12 = 50)
+        u16(0xB002); u16(7); u32(48); u32(50)
+        u32(0)                       // next IFD
+        // MP entry 1: primary
+        u32(0x030000)                // format JPEG | type primary
+        u32(primarySize); u32(0); u16(0); u16(0)
+        // MP entry 2: gain map
+        u32(0x000000)
+        u32(secondarySize); u32(0); u16(0); u16(0)
+        return buf.toByteArray()
+    }
+
+    private fun applyExif(target: File, source: ExifInterface?) {
+        if (source == null) return
+        runCatching {
+            val dst = ExifInterface(target.absolutePath)
+            for (tag in listOf(
+                ExifInterface.TAG_DATETIME_ORIGINAL,
+                ExifInterface.TAG_MAKE,
+                ExifInterface.TAG_MODEL,
+                ExifInterface.TAG_F_NUMBER,
+                ExifInterface.TAG_EXPOSURE_TIME,
+                ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY,
+                ExifInterface.TAG_FOCAL_LENGTH
+            )) {
+                source.getAttribute(tag)?.let { dst.setAttribute(tag, it) }
+            }
+            dst.saveAttributes()
+        }.onFailure { Log.w(TAG, "EXIF copy failed", it) }
     }
 }
