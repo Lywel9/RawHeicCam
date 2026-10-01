@@ -7,7 +7,7 @@ import android.graphics.Color
 import android.graphics.Gainmap
 import android.os.Build
 import android.util.Log
-import androidx.exifinterface.media.ExifInterface
+
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -71,7 +71,7 @@ object HeicTranscoder {
             Log.e(TAG, "Failed to decode JPEG")
             return null
         }
-        val exif = runCatching { ExifInterface(jpegFile.absolutePath) }.getOrNull()
+
 
         val hdrBitmap: Bitmap? = dngFile
             ?.takeIf { it.exists() && it.length() > 0 }
@@ -79,7 +79,7 @@ object HeicTranscoder {
 
         val gainMap = hdrBitmap?.let { computeGainMap(base, it) }
 
-        val encoded = encodeHeic(context, base, gainMap, exif) ?: run {
+        val encoded = encodeHeic(context, base, gainMap) ?: run {
             Log.w(TAG, "HEIC encode failed; falling back to JPEG")
             val fallback = File(context.cacheDir, "fallback_${System.currentTimeMillis()}.jpg")
             fallback.outputStream().use { base.compress(Bitmap.CompressFormat.JPEG, 95, it) }
@@ -130,9 +130,9 @@ object HeicTranscoder {
             if (rawLuma <= clip) continue // RAW also clipped — nothing to recover
 
             val headroom = min(1.5f, (rawLuma - clip) / max(clip, 0.05f))
-            val baseLinR = srgbToLinear(br / 255f)
-            val baseLinG = srgbToLinear(bg / 255f)
-            val baseLinB = srgbToLinear(bb / 255f)
+            val baseLinR = srgbDecode(br / 255f)
+            val baseLinG = srgbDecode(bg / 255f)
+            val baseLinB = srgbDecode(bb / 255f)
             val outLinR = min(PROXY_MAX_LINEAR, baseLinR + (rr - baseLinR) * headroom)
             val outLinG = min(PROXY_MAX_LINEAR, baseLinG + (rg - baseLinG) * headroom)
             val outLinB = min(PROXY_MAX_LINEAR, baseLinB + (rb - baseLinB) * headroom)
@@ -296,19 +296,23 @@ object HeicTranscoder {
 
         // DNG spec: raw data lives in SubIFDs pointed to from IFD0.
         val subOffsets = ifd0.tags[TAG_SUB_IFDS] ?: intArrayOf()
-        val rawIfd = subOffsets.firstNotNullOfOrNull { parseIfd(bytes, it, byteOrder) }
-            ?: ifd0
+        var rawIfd: Ifd? = null
+        for (off in subOffsets) {
+            rawIfd = parseIfd(bytes, off, byteOrder)
+            if (rawIfd != null) break
+        }
+        val raw = rawIfd ?: ifd0
 
-        val width = rawIfd.tags[TAG_IMAGE_WIDTH]?.firstOrNull() ?: return null
-        val height = rawIfd.tags[TAG_IMAGE_LENGTH]?.firstOrNull() ?: return null
-        val bits = rawIfd.tags[TAG_BITS_PER_SAMPLE]?.firstOrNull() ?: return null
-        val compression = rawIfd.tags[TAG_COMPRESSION]?.firstOrNull() ?: -1
-        val samples = rawIfd.tags[TAG_SAMPLES_PER_PIXEL]?.firstOrNull() ?: 1
-        val rowsPerStrip = rawIfd.tags[TAG_ROWS_PER_STRIP]?.firstOrNull() ?: height
-        val stripOffsets = rawIfd.tags[TAG_STRIP_OFFSETS] ?: return null
+        val width = raw.tags[TAG_IMAGE_WIDTH]?.firstOrNull() ?: return null
+        val height = raw.tags[TAG_IMAGE_LENGTH]?.firstOrNull() ?: return null
+        val bits = raw.tags[TAG_BITS_PER_SAMPLE]?.firstOrNull() ?: return null
+        val compression = raw.tags[TAG_COMPRESSION]?.firstOrNull() ?: -1
+        val samples = raw.tags[TAG_SAMPLES_PER_PIXEL]?.firstOrNull() ?: 1
+        val rowsPerStrip = raw.tags[TAG_ROWS_PER_STRIP]?.firstOrNull() ?: height
+        val stripOffsets = raw.tags[TAG_STRIP_OFFSETS] ?: return null
         val cfaPattern = ifd0.tags[TAG_CFA_PATTERN] ?: intArrayOf(0, 1, 1, 2)
-        val black = rawIfd.tags[TAG_BLACK_LEVEL]?.firstOrNull() ?: 0
-        val white = rawIfd.tags[TAG_WHITE_LEVEL]?.firstOrNull() ?: (1 shl bits) - 1
+        val black = raw.tags[TAG_BLACK_LEVEL]?.firstOrNull() ?: 0
+        val white = raw.tags[TAG_WHITE_LEVEL]?.firstOrNull() ?: (1 shl bits) - 1
 
         if (compression != COMPRESSION_UNCOMPRESSED) {
             Log.w(TAG, "DNG compression=$compression unsupported")
@@ -398,7 +402,7 @@ object HeicTranscoder {
      */
     private fun computeGainMap(sdr: Bitmap, hdr: Bitmap): Gainmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return null
-        return runCatching {
+        return runCatching<Gainmap?> {
             val w = sdr.width / GAIN_MAP_SCALE
             val h = sdr.height / GAIN_MAP_SCALE
             val smallSdr = Bitmap.createScaledBitmap(sdr, w, h, true)
@@ -429,12 +433,11 @@ object HeicTranscoder {
             smallSdr.recycle()
             smallHdr.recycle()
 
-            Gainmap.Builder(gain)
-                .setGainRatioContentsMinimum(minGain)
-                .setGainRatioContentsMaximum(maxGain)
-                .setMinContentRatio(1f)
-                .setMaxContentRatio(maxGain)
-                .build()
+            Gainmap(gain).apply {
+                setRatioMax(maxGain, maxGain, maxGain)
+                setMinDisplayRatioForHdrTransition(1f)
+                setDisplayRatioForFullHdr(maxGain)
+            }
         }.onFailure { Log.w(TAG, "gain map computation failed", it) }.getOrNull()
     }
 
@@ -452,8 +455,7 @@ object HeicTranscoder {
     private fun encodeHeic(
         context: Context,
         base: Bitmap,
-        gainMap: Gainmap?,
-        exif: ExifInterface?
+        gainMap: Gainmap?
     ): File? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
         // Probe that the platform encoder actually produces HEIF output.
@@ -477,26 +479,6 @@ object HeicTranscoder {
             outFile.delete()
             return null
         }
-        applyExif(outFile, exif)
         return outFile
-    }
-
-    private fun applyExif(target: File, source: ExifInterface?) {
-        if (source == null) return
-        runCatching {
-            val dst = ExifInterface(target.absolutePath)
-            for (tag in listOf(
-                ExifInterface.TAG_DATETIME_ORIGINAL,
-                ExifInterface.TAG_MAKE,
-                ExifInterface.TAG_MODEL,
-                ExifInterface.TAG_F_NUMBER,
-                ExifInterface.TAG_EXPOSURE_TIME,
-                ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY,
-                ExifInterface.TAG_FOCAL_LENGTH
-            )) {
-                source.getAttribute(tag)?.let { dst.setAttribute(tag, it) }
-            }
-            dst.saveAttributes()
-        }.onFailure { Log.w(TAG, "EXIF copy failed", it) }
     }
 }

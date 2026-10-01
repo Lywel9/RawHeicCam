@@ -39,12 +39,12 @@ class CameraController(private val context: Context) {
         val cameraInfo = provider.availableCameraInfos.firstOrNull {
             it.lensFacing == CameraSelector.LENS_FACING_BACK
         }
-        val id = cameraInfo?.cameraId ?: "?"
+        val id = if (cameraInfo != null) "back" else "?"
         val caps = cameraInfo?.let { ImageCapture.getImageCaptureCapabilities(it) }
         val formats = caps?.supportedOutputFormats.orEmpty()
         val mode = when {
             formats.contains(ImageCapture.OUTPUT_FORMAT_RAW_JPEG) -> RawMode.RAW_PLUS_JPEG
-            formats.contains(ImageCapture.OUTPUT_FORMAT_RAW_ONLY) -> RawMode.RAW_ONLY
+            formats.contains(ImageCapture.OUTPUT_FORMAT_RAW) -> RawMode.RAW_ONLY
             else -> RawMode.JPEG_ONLY
         }
         val ultraHdr = formats.contains(ImageCapture.OUTPUT_FORMAT_JPEG_ULTRA_HDR)
@@ -81,8 +81,8 @@ class CameraController(private val context: Context) {
             when {
                 formats.contains(ImageCapture.OUTPUT_FORMAT_RAW_JPEG) ->
                     setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW_JPEG)
-                formats.contains(ImageCapture.OUTPUT_FORMAT_RAW_ONLY) ->
-                    setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW_ONLY)
+                formats.contains(ImageCapture.OUTPUT_FORMAT_RAW) ->
+                    setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW)
             }
         }
         val imageCapture = builder.build()
