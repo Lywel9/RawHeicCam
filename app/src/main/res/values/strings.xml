@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">RawHeicCam</string>
+    <string name="action_attach">Attach to camera</string>
+    <string name="action_detach">Detach</string>
+    <string name="action_shoot">Capture RAW → HEIC now</string>
+    <string name="action_keep_dng">Keep original DNG alongside HEIC</string>
+    <string name="status_permissions_needed">Camera and notification permissions needed</string>
+    <string name="status_probe_running">Probing camera capabilities…</string>
+    <string name="status_probe_done">Camera %1$s ready</string>
+    <string name="status_probe_no_raw">This camera does not expose RAW output; shots will be SDR HEIC only</string>
+    <string name="status_attached">Attached — service is keeping the camera session warm</string>
+    <string name="status_detached">Detached</string>
+    <string name="status_capturing">Capturing…</string>
+    <string name="status_capture_saved">Saved to Pictures/RawHeicCam</string>
+    <string name="status_capture_failed">Capture failed — is the attach service running?</string>
+    <string name="notif_channel_name">Camera attach</string>
+    <string name="notif_channel_desc">Keeps the RAW→HEIC capture session alive</string>
+    <string name="notif_title">RawHeicCam attached</string>
+    <string name="notif_text">RAW→HEIC capture ready — gain map preserved</string>
+</resources>
